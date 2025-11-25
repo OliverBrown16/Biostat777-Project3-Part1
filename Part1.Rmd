@@ -24,10 +24,12 @@ con <- dbConnect(RSQLite::SQLite(), "project_3_baseball.db")
 data("People")
 data("Salaries")
 data("Batting")
+data("Pitching")
 
 if(!dbExistsTable(con, "people")) dbWriteTable(con, "people", People)
 if(!dbExistsTable(con, "salaries")) dbWriteTable(con, "salaries", Salaries)
 if(!dbExistsTable(con, "batting")) dbWriteTable(con, "batting", Batting)
+if(!dbExistsTable(con, "pitching")) dbWriteTable(con, "pitching", Pitching)
 
 ```
 
@@ -35,7 +37,9 @@ if(!dbExistsTable(con, "batting")) dbWriteTable(con, "batting", Batting)
 
 ## Research Question
 
+How do player performance metrics relate to salary classifications in Major League Baseball over the past decade, and can we predict whether a player is a "Star" based on these metrics?
 
+### Part 1A
 
 ```{r part1A}
 
@@ -48,7 +52,7 @@ SELECT
   AVG(salary) as avg_sal,
   MAX(salary) as max_sal
 FROM salaries
-WHERE yearID >= 2010
+WHERE yearID = 2015
 GROUP BY yearID
 ORDER BY yearID DESC
 "
@@ -145,20 +149,32 @@ SELECT
     WHEN s.salary > 4000000 THEN 'Star' 
     ELSE 'Normal' 
   END as Salary_Class,
-  SUM(b.HR) as HR,
-  SUM(b.H) as Hits,
-  SUM(b.RBI) as RBI,
   (s.yearID - p.birthYear) as Age,
-  (SELECT SUM(b2.HR) FROM batting b2 WHERE b2.playerID = s.playerID AND b2.yearID = s.yearID - 1) as Previous_HR
+  COALESCE(SUM(b.HR), 0) as HR,
+  COALESCE(SUM(b.H), 0) as Hits,
+  COALESCE(SUM(b.RBI), 0) as RBI,
+  COALESCE(SUM(pit.W), 0) as Wins,
+  COALESCE(SUM(pit.SV), 0) as Saves,
+  COALESCE(SUM(pit.SO), 0) as Pitching_SO,
+  COALESCE(
+    (SELECT SUM(b2.HR) FROM batting b2 WHERE b2.playerID = s.playerID AND b2.yearID = s.yearID - 1), 
+    0
+  ) as Previous_HR,
+  COALESCE(
+    (SELECT SUM(pit2.W) FROM pitching pit2 WHERE pit2.playerID = s.playerID AND pit2.yearID = s.yearID - 1), 
+    0
+  ) as Previous_Wins
 FROM salaries s
 JOIN people p ON s.playerID = p.playerID
-JOIN batting b ON s.playerID = b.playerID AND s.yearID = b.yearID
+LEFT JOIN batting b ON s.playerID = b.playerID AND s.yearID = b.yearID
+LEFT JOIN pitching pit ON s.playerID = pit.playerID AND s.yearID = pit.yearID
 WHERE s.yearID >= 2010
 GROUP BY s.yearID, s.playerID, s.salary, p.birthYear
 "
 
 class_data <- dbGetQuery(con, master_query)
 class_data <- na.omit(class_data)
+head(class_data, 5)
 
 # Visualization
 ggplot(class_data, aes(x = Salary_Class, y = HR, fill = Salary_Class)) +
@@ -171,17 +187,20 @@ ggplot(class_data, aes(x = Salary_Class, y = HR, fill = Salary_Class)) +
 
 ```
 
+# Part 1B
+
 ```{r part1B}
 
 set.seed(123)
 
 class_data$Salary_Class <- as.factor(class_data$Salary_Class)
 
-data_split <- initial_split(class_data, prop = 0.80, strata = Salary_Class)
+data_split <- initial_split(class_data, prop = 0.70, strata = Salary_Class)
 train_data <- training(data_split)
 test_data  <- testing(data_split)
 
-ml_recipe <- recipe(Salary_Class ~ Age + HR + Hits + RBI + Previous_HR, 
+ml_recipe <- recipe(Salary_Class ~ Age + HR + Hits + RBI + Previous_HR + 
+                     Wins + Saves + Pitching_SO + Previous_Wins, 
                     data = train_data) %>%
   step_normalize(all_numeric_predictors())
 
@@ -201,11 +220,8 @@ results <- ml_fit %>%
   bind_cols(predict(ml_fit, test_data, type = "prob")) %>%
   bind_cols(test_data)
 
-(acc <- results %>% accuracy(truth = Salary_Class, estimate = .pred_class))
-auc <- results %>% roc_auc(truth = Salary_Class, .pred_Star)
-auc$.estimate <- 1 - auc$.estimate
-auc
-
+results %>% accuracy(truth = Salary_Class, estimate = .pred_class, event_level = "second")
+results %>% roc_auc(truth = Salary_Class, .pred_Star, event_level = "second")
 
 results %>%
   roc_curve(truth = Salary_Class, .pred_Star, event_level = "second") %>%
@@ -215,39 +231,15 @@ tidy(ml_fit) %>%
   filter(term != "(Intercept)") %>%
   mutate(odds_ratio = exp(estimate)) %>%
   select(term, estimate, odds_ratio, p.value) %>%
-  arrange(desc(odds_ratio))
+  arrange(p.value)
 
 ```
 
-```{r}
+ACC $\approx$ 0.83
 
-plot_data <- results %>%
-  arrange(.pred_Star) %>%
-  mutate(
-    Index = row_number(),
-    Prediction_Type = case_when(
-      Salary_Class == "Star" & .pred_Star > 0.5 ~ "True Star",
-      Salary_Class == "Normal" & .pred_Star <= 0.5 ~ "True Normal",
-      Salary_Class == "Normal" & .pred_Star > 0.5 ~ "False Positive",
-      Salary_Class == "Star" & .pred_Star <= 0.5 ~ "False Negative"
-    )
-  )
+AUC $\approx$ 0.87
 
-ggplot(plot_data, aes(x = Index, y = .pred_Star)) +
-  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50", size = 0.8) +
-  geom_point(aes(color = Prediction_Type, shape = Salary_Class), alpha = 0.7, size = 2) +
-  scale_color_manual(values = c(
-    "True Star" = "#2E8B57",  
-    "True Normal" = "#4682B4",
-    "False Positive" = "#FF8C00",
-    "False Negative" = "#CD5C5C" 
-  )) +
-  labs(title = "Star Model Probability Curve",
-       x = "Player Index (Sorted by Predicted Probability)",
-       y = "Predicted Probability of Being a Star",
-       color = "Prediction Result",
-       shape = "Actual Salary Class") +
-  theme_minimal() +
-  theme(plot.title = element_text(size = 14))
+## Conclusion
 
-```
+
+
