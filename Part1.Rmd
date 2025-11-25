@@ -1,0 +1,253 @@
+---
+title: "Part1"
+author: "Oliver Brown"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+if (!requireNamespace("DBI", quietly = TRUE) ||
+    !requireNamespace("RSQLite", quietly = TRUE) ||
+    !requireNamespace("Lahman", quietly = TRUE) || 
+    !requireNamespace("tidymodels", quietly = TRUE)) {
+  install.packages(c("DBI", "RSQLite", "Lahman", "tidymodels"))
+}
+
+library(DBI)
+library(RSQLite)
+library(Lahman)
+library(dplyr)
+library(tidymodels)
+
+con <- dbConnect(RSQLite::SQLite(), "project_3_baseball.db")
+
+data("People")
+data("Salaries")
+data("Batting")
+
+if(!dbExistsTable(con, "people")) dbWriteTable(con, "people", People)
+if(!dbExistsTable(con, "salaries")) dbWriteTable(con, "salaries", Salaries)
+if(!dbExistsTable(con, "batting")) dbWriteTable(con, "batting", Batting)
+
+```
+
+# Part 1
+
+## Research Question
+
+
+
+```{r part1A}
+
+# Query 1
+
+query_dist <- "
+SELECT 
+  yearID,
+  MIN(salary) as min_sal,
+  AVG(salary) as avg_sal,
+  MAX(salary) as max_sal
+FROM salaries
+WHERE yearID >= 2010
+GROUP BY yearID
+ORDER BY yearID DESC
+"
+
+dbGetQuery(con, query_dist)
+# Based on this, we see Average is around $4 million for the last decade.
+
+# Query 2
+
+query_compare <- "
+SELECT 
+  CASE 
+    WHEN s.salary > 4000000 THEN 'Star_Salary'
+    ELSE 'Role_Player' 
+  END as Status,
+  AVG(b.HR) as Avg_HomeRuns,
+  AVG(b.H) as Avg_Hits,
+  COUNT(*) as Player_Count
+FROM salaries s
+JOIN batting b ON s.playerID = b.playerID AND s.yearID = b.yearID
+WHERE s.yearID >= 2010
+GROUP BY Status;
+"
+dbGetQuery(con, query_compare)
+
+# Query 3
+
+query_geo <- "
+SELECT 
+  birthCountry,
+  COUNT(playerID) as Total_Players,
+  SUM(Is_Star) as Unique_Stars,
+  ROUND(100.0 * SUM(Is_Star) / COUNT(playerID), 1) as Percent_Stars
+FROM (
+  SELECT 
+    p.birthCountry,
+    p.playerID,
+    MAX(CASE WHEN s.salary > 4000000 THEN 1 ELSE 0 END) as Is_Star
+  FROM people p
+  JOIN salaries s ON p.playerID = s.playerID
+  WHERE s.yearID >= 2010
+  GROUP BY p.birthCountry, p.playerID
+)
+GROUP BY birthCountry
+HAVING Total_Players > 10
+ORDER BY Unique_Stars DESC
+LIMIT 5;
+"
+
+print(dbGetQuery(con, query_geo))
+
+# Feature Engineering
+
+# Query 4
+
+feat_target_sql <- "
+SELECT 
+  playerID, 
+  salary,
+  CASE 
+    WHEN salary > 4000000 THEN 1 
+    ELSE 0 
+  END as Is_Star
+FROM salaries
+WHERE yearID = 2015
+LIMIT 5;
+"
+dbGetQuery(con, feat_target_sql)
+
+# Query 5
+
+feat_lag_sql <- "
+SELECT 
+  b1.playerID,
+  b1.yearID,
+  b1.H as Current_Hits,
+  COALESCE(b2.H, 0) as Previous_Hits
+FROM batting b1
+LEFT JOIN batting b2 
+  ON b1.playerID = b2.playerID 
+  AND b1.yearID = (b2.yearID + 1)
+WHERE b1.yearID = 2015
+LIMIT 5;
+"
+print(dbGetQuery(con, feat_lag_sql))
+
+# Query for visualization and modelling
+
+master_query <- "
+SELECT 
+  s.yearID,
+  s.playerID,
+  CASE 
+    WHEN s.salary > 4000000 THEN 'Star' 
+    ELSE 'Normal' 
+  END as Salary_Class,
+  SUM(b.HR) as HR,
+  SUM(b.H) as Hits,
+  SUM(b.RBI) as RBI,
+  (s.yearID - p.birthYear) as Age,
+  (SELECT SUM(b2.HR) FROM batting b2 WHERE b2.playerID = s.playerID AND b2.yearID = s.yearID - 1) as Previous_HR
+FROM salaries s
+JOIN people p ON s.playerID = p.playerID
+JOIN batting b ON s.playerID = b.playerID AND s.yearID = b.yearID
+WHERE s.yearID >= 2010
+GROUP BY s.yearID, s.playerID, s.salary, p.birthYear
+"
+
+class_data <- dbGetQuery(con, master_query)
+class_data <- na.omit(class_data)
+
+# Visualization
+ggplot(class_data, aes(x = Salary_Class, y = HR, fill = Salary_Class)) +
+  geom_boxplot() +
+  labs(title = "Do Home Runs determine Salary Class?",
+       subtitle = "Stars generally have higher medians, but there is overlap",
+       x = "Salary Classification",
+       y = "Home Runs") +
+  theme_minimal()
+
+```
+
+```{r part1B}
+
+set.seed(123)
+
+class_data$Salary_Class <- as.factor(class_data$Salary_Class)
+
+data_split <- initial_split(class_data, prop = 0.80, strata = Salary_Class)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+ml_recipe <- recipe(Salary_Class ~ Age + HR + Hits + RBI + Previous_HR, 
+                    data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+log_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+ml_workflow <- workflow() %>%
+  add_recipe(ml_recipe) %>%
+  add_model(log_spec)
+
+ml_fit <- ml_workflow %>% 
+  fit(data = train_data)
+
+results <- ml_fit %>%
+  predict(test_data) %>%
+  bind_cols(predict(ml_fit, test_data, type = "prob")) %>%
+  bind_cols(test_data)
+
+(acc <- results %>% accuracy(truth = Salary_Class, estimate = .pred_class))
+auc <- results %>% roc_auc(truth = Salary_Class, .pred_Star)
+auc$.estimate <- 1 - auc$.estimate
+auc
+
+
+results %>%
+  roc_curve(truth = Salary_Class, .pred_Star, event_level = "second") %>%
+  autoplot()
+
+tidy(ml_fit) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(odds_ratio = exp(estimate)) %>%
+  select(term, estimate, odds_ratio, p.value) %>%
+  arrange(desc(odds_ratio))
+
+```
+
+```{r}
+
+plot_data <- results %>%
+  arrange(.pred_Star) %>%
+  mutate(
+    Index = row_number(),
+    Prediction_Type = case_when(
+      Salary_Class == "Star" & .pred_Star > 0.5 ~ "True Star",
+      Salary_Class == "Normal" & .pred_Star <= 0.5 ~ "True Normal",
+      Salary_Class == "Normal" & .pred_Star > 0.5 ~ "False Positive",
+      Salary_Class == "Star" & .pred_Star <= 0.5 ~ "False Negative"
+    )
+  )
+
+ggplot(plot_data, aes(x = Index, y = .pred_Star)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50", size = 0.8) +
+  geom_point(aes(color = Prediction_Type, shape = Salary_Class), alpha = 0.7, size = 2) +
+  scale_color_manual(values = c(
+    "True Star" = "#2E8B57",  
+    "True Normal" = "#4682B4",
+    "False Positive" = "#FF8C00",
+    "False Negative" = "#CD5C5C" 
+  )) +
+  labs(title = "Star Model Probability Curve",
+       x = "Player Index (Sorted by Predicted Probability)",
+       y = "Predicted Probability of Being a Star",
+       color = "Prediction Result",
+       shape = "Actual Salary Class") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14))
+
+```
